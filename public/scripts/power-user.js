@@ -178,6 +178,7 @@ let power_user = {
     timestamps_enabled: true,
     timestamp_model_icon: false,
     mesIDDisplay_enabled: false,
+    hideChatAvatars_enabled: false,
     max_context_unlocked: false,
     message_token_count_enabled: false,
     expand_message_actions: false,
@@ -255,7 +256,7 @@ let power_user = {
     compact_input_area: true,
     auto_connect: false,
     auto_load_chat: false,
-    forbid_external_images: false,
+    forbid_external_media: true,
     external_media_allowed_overrides: [],
     external_media_forbidden_overrides: [],
 };
@@ -295,6 +296,7 @@ const storage_keys = {
     timestamps_enabled: 'TimestampsEnabled',
     timestamp_model_icon: 'TimestampModelIcon',
     mesIDDisplay_enabled: 'mesIDDisplayEnabled',
+    hideChatAvatars_enabled: 'hideChatAvatarsEnabled',
     message_token_count_enabled: 'MessageTokenCountEnabled',
     expand_message_actions: 'ExpandMessageActions',
     enableZenSliders: 'enableZenSliders',
@@ -323,7 +325,7 @@ const contextControls = [
 let browser_has_focus = true;
 const debug_functions = [];
 
-const setHotswapsDebounced = debounce(favsToHotswap, 500);
+const setHotswapsDebounced = debounce(favsToHotswap);
 
 export function switchSimpleMode() {
     $('[data-newbie-hidden]').each(function () {
@@ -462,6 +464,17 @@ function switchMesIDDisplay() {
         poweruser after:${power_user.mesIDDisplay_enabled}`) */
     $('body').toggleClass('no-mesIDDisplay', !power_user.mesIDDisplay_enabled);
     $('#mesIDDisplayEnabled').prop('checked', power_user.mesIDDisplay_enabled);
+}
+
+function switchHideChatAvatars() {
+    const value = localStorage.getItem(storage_keys.hideChatAvatars_enabled);
+    power_user.hideChatAvatars_enabled = value === null ? false : value == 'true';
+    /*console.log(`
+        localstorage value:${value},
+        poweruser after:${power_user.hideChatAvatars_enabled}`)
+    */
+    $('body').toggleClass('hideChatAvatars', power_user.hideChatAvatars_enabled);
+    $('#hideChatAvatarsEnabled').prop('checked', power_user.hideChatAvatars_enabled);
 }
 
 function switchMessageActions() {
@@ -819,7 +832,7 @@ async function CreateZenSliders(elmnt) {
                         isManualInput = true;
                         //allow enter to trigger slider update
                         if (e.key === 'Enter') {
-                            e.preventDefault;
+                            e.preventDefault();
                             handle.trigger('blur');
                         }
                     })
@@ -1270,6 +1283,13 @@ async function applyTheme(name) {
             },
         },
         {
+            key: 'hideChatAvatars_enabled',
+            action: async () => {
+                localStorage.setItem(storage_keys.hideChatAvatars_enabled, Boolean(power_user.hideChatAvatars_enabled));
+                switchHideChatAvatars();
+            },
+        },
+        {
             key: 'expand_message_actions',
             action: async () => {
                 localStorage.setItem(storage_keys.expand_message_actions, Boolean(power_user.expand_message_actions));
@@ -1391,6 +1411,7 @@ switchTimer();
 switchTimestamps();
 switchIcons();
 switchMesIDDisplay();
+switchHideChatAvatars();
 switchTokenCount();
 switchMessageActions();
 
@@ -1433,6 +1454,7 @@ function loadPowerUserSettings(settings, data) {
     const timer = localStorage.getItem(storage_keys.timer_enabled);
     const timestamps = localStorage.getItem(storage_keys.timestamps_enabled);
     const mesIDDisplay = localStorage.getItem(storage_keys.mesIDDisplay_enabled);
+    const hideChatAvatars = localStorage.getItem(storage_keys.hideChatAvatars_enabled);
     const expandMessageActions = localStorage.getItem(storage_keys.expand_message_actions);
     const enableZenSliders = localStorage.getItem(storage_keys.enableZenSliders);
     const enableLabMode = localStorage.getItem(storage_keys.enableLabMode);
@@ -1456,6 +1478,7 @@ function loadPowerUserSettings(settings, data) {
     power_user.timer_enabled = timer === null ? true : timer == 'true';
     power_user.timestamps_enabled = timestamps === null ? true : timestamps == 'true';
     power_user.mesIDDisplay_enabled = mesIDDisplay === null ? true : mesIDDisplay == 'true';
+    power_user.hideChatAvatars_enabled = hideChatAvatars === null ? true : hideChatAvatars == 'true';
     power_user.expand_message_actions = expandMessageActions === null ? true : expandMessageActions == 'true';
     power_user.enableZenSliders = enableZenSliders === null ? false : enableZenSliders == 'true';
     power_user.enableLabMode = enableLabMode === null ? false : enableLabMode == 'true';
@@ -1541,6 +1564,7 @@ function loadPowerUserSettings(settings, data) {
     $('#messageTimestampsEnabled').prop('checked', power_user.timestamps_enabled);
     $('#messageModelIconEnabled').prop('checked', power_user.timestamp_model_icon);
     $('#mesIDDisplayEnabled').prop('checked', power_user.mesIDDisplay_enabled);
+    $('#hideChatAvatarsEndabled').prop('checked', power_user.hideChatAvatars_enabled);
     $('#prefer_character_prompt').prop('checked', power_user.prefer_character_prompt);
     $('#prefer_character_jailbreak').prop('checked', power_user.prefer_character_jailbreak);
     $('#enableZenSliders').prop('checked', power_user.enableZenSliders).trigger('input');
@@ -1584,7 +1608,7 @@ function loadPowerUserSettings(settings, data) {
     $('#reduced_motion').prop('checked', power_user.reduced_motion);
     $('#auto-connect-checkbox').prop('checked', power_user.auto_connect);
     $('#auto-load-chat-checkbox').prop('checked', power_user.auto_load_chat);
-    $('#forbid_external_images').prop('checked', power_user.forbid_external_images);
+    $('#forbid_external_media').prop('checked', power_user.forbid_external_media);
 
     for (const theme of themes) {
         const option = document.createElement('option');
@@ -2150,6 +2174,7 @@ async function saveTheme(name = undefined) {
         timestamp_model_icon: power_user.timestamp_model_icon,
 
         mesIDDisplay_enabled: power_user.mesIDDisplay_enabled,
+        hideChatAvatars_enabled: power_user.hideChatAvatars_enabled,
         message_token_count_enabled: power_user.message_token_count_enabled,
         expand_message_actions: power_user.expand_message_actions,
         enableZenSliders: power_user.enableZenSliders,
@@ -2373,7 +2398,7 @@ async function doRandomChat(_, tagName) {
             .map(x => x[0]) // Map the character avatar
             .filter(x => characters.find(y => y.avatar === x)); // Filter out characters that don't exist
         const randomCharacter = taggedCharacters[Math.floor(Math.random() * taggedCharacters.length)];
-        const randomIndex =  characters.findIndex(x => x.avatar === randomCharacter);
+        const randomIndex = characters.findIndex(x => x.avatar === randomCharacter);
         if (randomIndex === -1) {
             return;
         }
@@ -3376,6 +3401,13 @@ $(document).ready(() => {
         switchMesIDDisplay();
     });
 
+    $('#hideChatAvatarsEnabled').on('input', function () {
+        const value = !!$(this).prop('checked');
+        power_user.hideChatAvatars_enabled = value;
+        localStorage.setItem(storage_keys.hideChatAvatars_enabled, Boolean(power_user.hideChatAvatars_enabled));
+        switchHideChatAvatars();
+    });
+
     $('#hotswapEnabled').on('input', function () {
         const value = !!$(this).prop('checked');
         power_user.hotswap_enabled = value;
@@ -3527,8 +3559,8 @@ $(document).ready(() => {
         saveSettingsDebounced();
     });
 
-    $('#forbid_external_images').on('input', function () {
-        power_user.forbid_external_images = !!$(this).prop('checked');
+    $('#forbid_external_media').on('input', function () {
+        power_user.forbid_external_media = !!$(this).prop('checked');
         saveSettingsDebounced();
         reloadCurrentChat();
     });

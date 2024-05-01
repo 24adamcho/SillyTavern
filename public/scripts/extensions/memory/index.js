@@ -1,4 +1,4 @@
-import { getStringHash, debounce, waitUntilCondition, extractAllWords, delay } from '../../utils.js';
+import { getStringHash, debounce, waitUntilCondition, extractAllWords } from '../../utils.js';
 import { getContext, getApiUrl, extension_settings, doExtrasFetch, modules, renderExtensionTemplateAsync } from '../../extensions.js';
 import {
     activateSendButtons,
@@ -20,6 +20,7 @@ import { registerSlashCommand } from '../../slash-commands.js';
 import { loadMovingUIState } from '../../power-user.js';
 import { dragElement } from '../../RossAscends-mods.js';
 import { getTextTokens, getTokenCountAsync, tokenizers } from '../../tokenizers.js';
+import { debounce_timeout } from '../../constants.js';
 export { MODULE_NAME };
 
 const MODULE_NAME = '1_memory';
@@ -46,7 +47,7 @@ const formatMemoryValue = function (value) {
     }
 };
 
-const saveChatDebounced = debounce(() => getContext().saveChat(), 2000);
+const saveChatDebounced = debounce(() => getContext().saveChat(), debounce_timeout.relaxed);
 
 const summary_sources = {
     'extras': 'extras',

@@ -31,7 +31,7 @@ import {
     system_message_types,
     this_chid,
 } from '../script.js';
-import { groups, selected_group } from './group-chats.js';
+import { selected_group } from './group-chats.js';
 import { registerSlashCommand } from './slash-commands.js';
 
 import {
@@ -1009,6 +1009,15 @@ async function populateChatCompletion(prompts, chatCompletion, { bias, quietProm
         }
     }
 
+    // Vectors Data Bank
+    if (prompts.has('vectorsDataBank')) {
+        const vectorsDataBank = prompts.get('vectorsDataBank');
+
+        if (vectorsDataBank.position) {
+            chatCompletion.insert(Message.fromPrompt(vectorsDataBank), 'main', vectorsDataBank.position);
+        }
+    }
+
     // Smart Context (ChromaDB)
     if (prompts.has('smartContext')) {
         const smartContext = prompts.get('smartContext');
@@ -1098,6 +1107,14 @@ function preparePromptsForChatCompletion({ Scenario, charPersonality, name2, wor
         content: vectorsMemory.value,
         identifier: 'vectorsMemory',
         position: getPromptPosition(vectorsMemory.position),
+    });
+
+    const vectorsDataBank = extensionPrompts['4_vectors_data_bank'];
+    if (vectorsDataBank && vectorsDataBank.value) systemPrompts.push({
+        role: getPromptRole(vectorsDataBank.role),
+        content: vectorsDataBank.value,
+        identifier: 'vectorsDataBank',
+        position: getPromptPosition(vectorsDataBank.position),
     });
 
     // Smart Context (ChromaDB)
@@ -1606,6 +1623,11 @@ async function sendAltScaleRequest(messages, logit_bias, signal, type) {
         headers: getRequestHeaders(),
         signal: signal,
     });
+
+    if (!response.ok) {
+        tryParseStreamingError(response, await response.text());
+        throw new Error('Scale response does not indicate success.');
+    }
 
     const data = await response.json();
     return data.output;
@@ -3228,7 +3250,8 @@ async function onExportPresetClick() {
     delete preset.proxy_password;
 
     const presetJsonString = JSON.stringify(preset, null, 4);
-    download(presetJsonString, oai_settings.preset_settings_openai, 'application/json');
+    const presetFileName = `${oai_settings.preset_settings_openai}.json`;
+    download(presetJsonString, presetFileName, 'application/json');
 }
 
 async function onLogitBiasPresetImportFileChange(e) {
@@ -3276,7 +3299,8 @@ function onLogitBiasPresetExportClick() {
     }
 
     const presetJsonString = JSON.stringify(oai_settings.bias_presets[oai_settings.bias_preset_selected], null, 4);
-    download(presetJsonString, oai_settings.bias_preset_selected, 'application/json');
+    const presetFileName = `${oai_settings.bias_preset_selected}.json`;
+    download(presetJsonString, presetFileName, 'application/json');
 }
 
 async function onDeletePresetClick() {
@@ -3603,6 +3627,7 @@ async function onModelChange() {
         }
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
         $('#openai_max_context').val(oai_settings.openai_max_context).trigger('input');
+        $('#temp_openai').attr('max', oai_max_temp).val(oai_settings.temp_openai).trigger('input');
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.MAKERSUITE) {
@@ -3730,6 +3755,7 @@ async function onModelChange() {
         }
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
         $('#openai_max_context').val(oai_settings.openai_max_context).trigger('input');
+        $('#temp_openai').attr('max', claude_max_temp).val(oai_settings.temp_openai).trigger('input');
     }
 
     if (oai_settings.chat_completion_source === chat_completion_sources.PERPLEXITY) {
@@ -3790,6 +3816,7 @@ async function onModelChange() {
         $('#openai_max_context').attr('max', unlocked_max);
         oai_settings.openai_max_context = Math.min(Number($('#openai_max_context').attr('max')), oai_settings.openai_max_context);
         $('#openai_max_context').val(oai_settings.openai_max_context).trigger('input');
+        $('#temp_openai').attr('max', oai_max_temp).val(oai_settings.temp_openai).trigger('input');
     }
 
     $('#openai_max_context_counter').attr('max', Number($('#openai_max_context').attr('max')));

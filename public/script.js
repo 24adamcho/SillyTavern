@@ -152,7 +152,9 @@ import {
     Stopwatch,
     isValidUrl,
     ensureImageFormatSupported,
+    flashHighlight,
 } from './scripts/utils.js';
+import { debounce_timeout } from './scripts/constants.js';
 
 import { ModuleWorkerWrapper, doDailyExtensionUpdatesCheck, extension_settings, getContext, loadExtensionSettings, renderExtensionTemplate, renderExtensionTemplateAsync, runGenerationInterceptors, saveMetadataDebounced, writeExtensionField } from './scripts/extensions.js';
 import { COMMENT_NAME_DEFAULT, executeSlashCommands, getSlashCommandsHelp, processChatSlashCommands, registerSlashCommand } from './scripts/slash-commands.js';
@@ -202,7 +204,7 @@ import {
     instruct_presets,
     selectContextPreset,
 } from './scripts/instruct-mode.js';
-import { applyLocale, initLocales } from './scripts/i18n.js';
+import { initLocales } from './scripts/i18n.js';
 import { getFriendlyTokenizerName, getTokenCount, getTokenCountAsync, getTokenizerModel, initTokenizers, saveTokenCache } from './scripts/tokenizers.js';
 import { createPersona, initPersonas, selectCurrentPersona, setPersonaDescription, updatePersonaNameIfExists } from './scripts/personas.js';
 import { getBackgrounds, initBackgrounds, loadBackgroundSettings, background_settings } from './scripts/backgrounds.js';
@@ -212,8 +214,10 @@ import { loadMancerModels, loadOllamaModels, loadTogetherAIModels, loadInfermati
 import { appendFileContent, hasPendingFileAttachment, populateFileAttachment, decodeStyleTags, encodeStyleTags, isExternalMediaAllowed, getCurrentEntityId } from './scripts/chats.js';
 import { initPresetManager } from './scripts/preset-manager.js';
 import { evaluateMacros } from './scripts/macros.js';
+import { currentUser, setUserControls } from './scripts/user.js';
 import { callGenericPopup } from './scripts/popup.js';
 import { renderTemplate, renderTemplateAsync } from './scripts/templates.js';
+import { ScraperManager } from './scripts/scrapers.js';
 
 //exporting functions and vars for mods
 export {
@@ -289,7 +293,21 @@ export {
     isOdd,
     countOccurrences,
     renderTemplate,
+    itemizedPrompts,
+    findItemizedPromptSet,
+    itemizedParams,
 };
+
+/**
+ * Wait for page to load before continuing the app initialization.
+ */
+await new Promise((resolve) => {
+    if (document.readyState === 'complete') {
+        resolve();
+    } else {
+        window.addEventListener('load', resolve);
+    }
+});
 
 showLoader();
 // Yoink preloader entirely; it only exists to cover up unstyled content while loading JS
@@ -374,6 +392,11 @@ DOMPurify.addHook('uponSanitizeElement', (node, _, config) => {
                 mediaBlocked = true;
                 node.remove();
             }
+
+            if (mediaBlocked && (node instanceof HTMLMediaElement)) {
+                node.autoplay = false;
+                node.pause();
+            }
         }
             break;
     }
@@ -446,6 +469,8 @@ export const event_types = {
     CHARACTER_DELETED: 'characterDeleted',
     CHARACTER_DUPLICATED: 'character_duplicated',
     SMOOTH_STREAM_TOKEN_RECEIVED: 'smooth_stream_token_received',
+    FILE_ATTACHMENT_DELETED: 'file_attachment_deleted',
+    WORLDINFO_FORCE_ACTIVATE: 'worldinfo_force_activate',
 };
 
 export const eventSource = new EventEmitter();
@@ -525,7 +550,8 @@ let fav_ch_checked = false;
 let scrollLock = false;
 export let abortStatusCheck = new AbortController();
 
-const durationSaveEdit = 1000;
+/** @type {number} The debounce timeout used for chat/settings save. debounce_timeout.long: 1.000 ms */
+const durationSaveEdit = debounce_timeout.relaxed;
 const saveSettingsDebounced = debounce(() => saveSettings(), durationSaveEdit);
 export const saveCharacterDebounced = debounce(() => $('#create_button').trigger('click'), durationSaveEdit);
 
@@ -535,7 +561,7 @@ export const saveCharacterDebounced = debounce(() => $('#create_button').trigger
  *
  * The printing will also always reprint all filter options of the global list, to keep them up to date.
  */
-const printCharactersDebounced = debounce(() => { printCharacters(false); }, 100);
+const printCharactersDebounced = debounce(() => { printCharacters(false); }, debounce_timeout.quick);
 
 /**
  * @enum {string} System message types
@@ -666,13 +692,15 @@ async function getSystemMessages() {
 registerPromptManagerMigration();
 
 $(document).ajaxError(function myErrorHandler(_, xhr) {
+    // Cohee: CSRF doesn't error out in multiple tabs anymore, so this is unnecessary
+    /*
     if (xhr.status == 403) {
         toastr.warning(
             'doubleCsrf errors in console are NORMAL in this case. If you want to run ST in multiple tabs, start the server with --disableCsrf option.',
             'Looks like you\'ve opened SillyTavern in another browser tab',
             { timeOut: 0, extendedTimeOut: 0, preventDuplicates: true },
         );
-    }
+    } */
 });
 
 async function getClientVersion() {
@@ -701,6 +729,7 @@ function reloadMarkdownProcessor(render_formulas = false) {
             underline: true,
             tables: true,
             parseImgDimensions: true,
+            simpleLineBreaks: true,
             extensions: [
                 showdownKatex(
                     {
@@ -719,6 +748,7 @@ function reloadMarkdownProcessor(render_formulas = false) {
             parseImgDimensions: true,
             tables: true,
             underline: true,
+            simpleLineBreaks: true,
             extensions: [markdownUnderscoreExt()],
         });
     }
@@ -831,7 +861,7 @@ export let active_character = '';
 export let active_group = '';
 
 export const entitiesFilter = new FilterHelper(printCharactersDebounced);
-export const personasFilter = new FilterHelper(debounce(getUserAvatars, 100));
+export const personasFilter = new FilterHelper(debounce(getUserAvatars, debounce_timeout.quick));
 
 export function getRequestHeaders() {
     return {
@@ -1333,7 +1363,7 @@ async function printCharacters(fullRefresh = false) {
             }
 
             const hidden = (characters.length + groups.length) - displayCount;
-            if (hidden > 0) {
+            if (hidden > 0 && entitiesFilter.hasAnyFilter()) {
                 $(listId).append(getHiddenBlock(hidden));
             }
 
@@ -1501,7 +1531,7 @@ function getCharacterSource(chId = this_chid) {
 }
 
 async function getCharacters() {
-    var response = await fetch('/api/characters/all', {
+    const response = await fetch('/api/characters/all', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify({
@@ -1509,11 +1539,9 @@ async function getCharacters() {
         }),
     });
     if (response.ok === true) {
-        var getData = ''; //RossAscends: reset to force array to update to account for deleted character.
-        getData = await response.json();
-        const load_ch_count = Object.getOwnPropertyNames(getData);
-        for (var i = 0; i < load_ch_count.length; i++) {
-            characters[i] = [];
+        characters.splice(0, characters.length);
+        const getData = await response.json();
+        for (let i = 0; i < getData.length; i++) {
             characters[i] = getData[i];
             characters[i]['name'] = DOMPurify.sanitize(characters[i]['name']);
 
@@ -1786,9 +1814,7 @@ function messageFormatting(mes, ch_name, isSystem, isUser, messageId) {
     }
 
     if (this_chid === undefined && !selected_group) {
-        mes = mes
-            .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
-            .replace(/\n/g, '<br/>');
+        mes = mes.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
     } else if (!isSystem) {
         // Save double quotes in tags as a special character to prevent them from being encoded
         if (!power_user.encode_tags) {
@@ -1820,7 +1846,6 @@ function messageFormatting(mes, ch_name, isSystem, isUser, messageId) {
             // Firefox creates extra newlines from <br>s in code blocks, so we replace them before converting newlines to <br>s.
             return match.replace(/\n/gm, '\u0000');
         });
-        mes = mes.replace(/\n/g, '<br/>');
         mes = mes.replace(/\u0000/g, '\n'); // Restore converted newlines
         mes = mes.trim();
 
@@ -1837,7 +1862,7 @@ function messageFormatting(mes, ch_name, isSystem, isUser, messageId) {
     */
 
     if (!power_user.allow_name2_display && ch_name && !isUser && !isSystem) {
-        mes = mes.replace(new RegExp(`(^|\n)${ch_name}:`, 'g'), '$1');
+        mes = mes.replace(new RegExp(`(^|\n)${escapeRegex(ch_name)}:`, 'g'), '$1');
     }
 
     /** @type {any} */
@@ -3776,6 +3801,7 @@ async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, qu
 
     // Fetches the combined prompt for both negative and positive prompts
     const cfgGuidanceScale = getGuidanceScale();
+    const useCfgPrompt = cfgGuidanceScale && cfgGuidanceScale.value !== 1;
 
     // For prompt bit itemization
     let mesSendString = '';
@@ -3783,7 +3809,7 @@ async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, qu
     function getCombinedPrompt(isNegative) {
         // Only return if the guidance scale doesn't exist or the value is 1
         // Also don't return if constructing the neutral prompt
-        if (isNegative && (!cfgGuidanceScale || cfgGuidanceScale?.value === 1)) {
+        if (isNegative && !useCfgPrompt) {
             return;
         }
 
@@ -3795,22 +3821,20 @@ async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, qu
         // Deep clone
         let finalMesSend = structuredClone(mesSend);
 
-        let cfgPrompt = {};
-        if (cfgGuidanceScale && cfgGuidanceScale?.value !== 1) {
-            cfgPrompt = getCfgPrompt(cfgGuidanceScale, isNegative);
-        }
-
-        if (cfgPrompt && cfgPrompt?.value) {
-            if (cfgPrompt?.depth === 0) {
-                finalMesSend[finalMesSend.length - 1].message +=
-                    /\s/.test(finalMesSend[finalMesSend.length - 1].message.slice(-1))
-                        ? cfgPrompt.value
-                        : ` ${cfgPrompt.value}`;
-            } else {
-                // TODO: Make all extension prompts use an array/splice method
-                const lengthDiff = mesSend.length - cfgPrompt.depth;
-                const cfgDepth = lengthDiff >= 0 ? lengthDiff : 0;
-                finalMesSend[cfgDepth].extensionPrompts.push(`${cfgPrompt.value}\n`);
+        if (useCfgPrompt) {
+            const cfgPrompt = getCfgPrompt(cfgGuidanceScale, isNegative);
+            if (cfgPrompt.value) {
+                if (cfgPrompt.depth === 0) {
+                    finalMesSend[finalMesSend.length - 1].message +=
+                        /\s/.test(finalMesSend[finalMesSend.length - 1].message.slice(-1))
+                            ? cfgPrompt.value
+                            : ` ${cfgPrompt.value}`;
+                } else {
+                    // TODO: Make all extension prompts use an array/splice method
+                    const lengthDiff = mesSend.length - cfgPrompt.depth;
+                    const cfgDepth = lengthDiff >= 0 ? lengthDiff : 0;
+                    finalMesSend[cfgDepth].extensionPrompts.push(`${cfgPrompt.value}\n`);
+                }
             }
         }
 
@@ -3891,75 +3915,78 @@ async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, qu
         return !data.combinedPrompt ? combine() : data.combinedPrompt;
     }
 
-    // Get the negative prompt first since it has the unmodified mesSend array
-    let negativePrompt = main_api == 'textgenerationwebui' ? getCombinedPrompt(true) : undefined;
     let finalPrompt = getCombinedPrompt(false);
-
-    // Include the entire guidance scale object
-    const cfgValues = cfgGuidanceScale && cfgGuidanceScale?.value !== 1 ? ({ guidanceScale: cfgGuidanceScale, negativePrompt: negativePrompt }) : null;
 
     let maxLength = Number(amount_gen); // how many tokens the AI will be requested to generate
     let thisPromptBits = [];
 
-    // TODO: Make this a switch
-    if (main_api == 'koboldhorde' && horde_settings.auto_adjust_response_length) {
-        maxLength = Math.min(maxLength, adjustedParams.maxLength);
-        maxLength = Math.max(maxLength, MIN_LENGTH); // prevent validation errors
-    }
-
     let generate_data;
-    if (main_api == 'koboldhorde' || main_api == 'kobold') {
-        generate_data = {
-            prompt: finalPrompt,
-            gui_settings: true,
-            max_length: maxLength,
-            max_context_length: max_context,
-            api_server,
-        };
+    switch (main_api) {
+        case 'koboldhorde':
+        case 'kobold':
+            if (main_api == 'koboldhorde' && horde_settings.auto_adjust_response_length) {
+                maxLength = Math.min(maxLength, adjustedParams.maxLength);
+                maxLength = Math.max(maxLength, MIN_LENGTH); // prevent validation errors
+            }
 
-        if (preset_settings != 'gui') {
-            const isHorde = main_api == 'koboldhorde';
-            const presetSettings = koboldai_settings[koboldai_setting_names[preset_settings]];
-            const maxContext = (adjustedParams && horde_settings.auto_adjust_context_length) ? adjustedParams.maxContextLength : max_context;
-            generate_data = getKoboldGenerationData(finalPrompt, presetSettings, maxLength, maxContext, isHorde, type);
+            generate_data = {
+                prompt: finalPrompt,
+                gui_settings: true,
+                max_length: maxLength,
+                max_context_length: max_context,
+                api_server,
+            };
+
+            if (preset_settings != 'gui') {
+                const isHorde = main_api == 'koboldhorde';
+                const presetSettings = koboldai_settings[koboldai_setting_names[preset_settings]];
+                const maxContext = (adjustedParams && horde_settings.auto_adjust_context_length) ? adjustedParams.maxContextLength : max_context;
+                generate_data = getKoboldGenerationData(finalPrompt, presetSettings, maxLength, maxContext, isHorde, type);
+            }
+            break;
+        case 'textgenerationwebui': {
+            const cfgValues = useCfgPrompt ? { guidanceScale: cfgGuidanceScale, negativePrompt: getCombinedPrompt(true) } : null;
+            generate_data = getTextGenGenerationData(finalPrompt, maxLength, isImpersonate, isContinue, cfgValues, type);
+            break;
         }
-    }
-    else if (main_api == 'textgenerationwebui') {
-        generate_data = getTextGenGenerationData(finalPrompt, maxLength, isImpersonate, isContinue, cfgValues, type);
-    }
-    else if (main_api == 'novel') {
-        const presetSettings = novelai_settings[novelai_setting_names[nai_settings.preset_settings_novel]];
-        generate_data = getNovelGenerationData(finalPrompt, presetSettings, maxLength, isImpersonate, isContinue, cfgValues, type);
-    }
-    else if (main_api == 'openai') {
-        let [prompt, counts] = await prepareOpenAIMessages({
-            name2: name2,
-            charDescription: description,
-            charPersonality: personality,
-            Scenario: scenario,
-            worldInfoBefore: worldInfoBefore,
-            worldInfoAfter: worldInfoAfter,
-            extensionPrompts: extension_prompts,
-            bias: promptBias,
-            type: type,
-            quietPrompt: quiet_prompt,
-            quietImage: quietImage,
-            cyclePrompt: cyclePrompt,
-            systemPromptOverride: system,
-            jailbreakPromptOverride: jailbreak,
-            personaDescription: persona,
-            messages: oaiMessages,
-            messageExamples: oaiMessageExamples,
-        }, dryRun);
-        generate_data = { prompt: prompt };
-
-        // counts will return false if the user has not enabled the token breakdown feature
-        if (counts) {
-            parseTokenCounts(counts, thisPromptBits);
+        case 'novel': {
+            const cfgValues = useCfgPrompt ? { guidanceScale: cfgGuidanceScale } : null;
+            const presetSettings = novelai_settings[novelai_setting_names[nai_settings.preset_settings_novel]];
+            generate_data = getNovelGenerationData(finalPrompt, presetSettings, maxLength, isImpersonate, isContinue, cfgValues, type);
+            break;
         }
+        case 'openai': {
+            let [prompt, counts] = await prepareOpenAIMessages({
+                name2: name2,
+                charDescription: description,
+                charPersonality: personality,
+                Scenario: scenario,
+                worldInfoBefore: worldInfoBefore,
+                worldInfoAfter: worldInfoAfter,
+                extensionPrompts: extension_prompts,
+                bias: promptBias,
+                type: type,
+                quietPrompt: quiet_prompt,
+                quietImage: quietImage,
+                cyclePrompt: cyclePrompt,
+                systemPromptOverride: system,
+                jailbreakPromptOverride: jailbreak,
+                personaDescription: persona,
+                messages: oaiMessages,
+                messageExamples: oaiMessageExamples,
+            }, dryRun);
+            generate_data = { prompt: prompt };
 
-        if (!dryRun) {
-            setInContextMessages(openai_messages_count, type);
+            // TODO: move these side-effects somewhere else, so this switch-case solely sets generate_data
+            // counts will return false if the user has not enabled the token breakdown feature
+            if (counts) {
+                parseTokenCounts(counts, thisPromptBits);
+            }
+
+            if (!dryRun) {
+                setInContextMessages(openai_messages_count, type);
+            }
+            break;
         }
     }
 
@@ -4007,16 +4034,14 @@ async function Generate(type, { automatic_trigger, force_name2, quiet_prompt, qu
             userPersona: (power_user.persona_description || ''),
         };
 
-        thisPromptBits = additionalPromptStuff;
-
-        //console.log(thisPromptBits);
-        const itemizedIndex = itemizedPrompts.findIndex((item) => item.mesId === thisPromptBits['mesId']);
+        //console.log(additionalPromptStuff);
+        const itemizedIndex = itemizedPrompts.findIndex((item) => item.mesId === additionalPromptStuff.mesId);
 
         if (itemizedIndex !== -1) {
-            itemizedPrompts[itemizedIndex] = thisPromptBits;
+            itemizedPrompts[itemizedIndex] = additionalPromptStuff;
         }
         else {
-            itemizedPrompts.push(thisPromptBits);
+            itemizedPrompts.push(additionalPromptStuff);
         }
 
         console.debug(`pushed prompt bits to itemizedPrompts array. Length is now: ${itemizedPrompts.length}`);
@@ -4583,29 +4608,7 @@ async function DupeChar() {
     }
 }
 
-async function promptItemize(itemizedPrompts, requestedMesId) {
-    console.log('PROMPT ITEMIZE ENTERED');
-    var incomingMesId = Number(requestedMesId);
-    console.debug(`looking for MesId ${incomingMesId}`);
-    var thisPromptSet = undefined;
-
-    for (var i = 0; i < itemizedPrompts.length; i++) {
-        console.log(`looking for ${incomingMesId} vs ${itemizedPrompts[i].mesId}`);
-        if (itemizedPrompts[i].mesId === incomingMesId) {
-            console.log(`found matching mesID ${i}`);
-            thisPromptSet = i;
-            PromptArrayItemForRawPromptDisplay = i;
-            console.log(`wanting to raw display of ArrayItem: ${PromptArrayItemForRawPromptDisplay} which is mesID ${incomingMesId}`);
-            console.log(itemizedPrompts[thisPromptSet]);
-        }
-    }
-
-    if (thisPromptSet === undefined) {
-        console.log(`couldnt find the right mesId. looked for ${incomingMesId}`);
-        console.log(itemizedPrompts);
-        return null;
-    }
-
+async function itemizedParams(itemizedPrompts, thisPromptSet) {
     const params = {
         charDescriptionTokens: await getTokenCountAsync(itemizedPrompts[thisPromptSet].charDescription),
         charPersonalityTokens: await getTokenCountAsync(itemizedPrompts[thisPromptSet].charPersonality),
@@ -4704,6 +4707,38 @@ async function promptItemize(itemizedPrompts, requestedMesId) {
         params.allAnchorsTokensPercentage = ((params.allAnchorsTokens / (params.totalTokensInPrompt)) * 100).toFixed(2);
         params.selectedTokenizer = getFriendlyTokenizerName(params.this_main_api).tokenizerName;
     }
+    return params;
+}
+
+function findItemizedPromptSet(itemizedPrompts, incomingMesId) {
+    var thisPromptSet = undefined;
+
+    for (var i = 0; i < itemizedPrompts.length; i++) {
+        console.log(`looking for ${incomingMesId} vs ${itemizedPrompts[i].mesId}`);
+        if (itemizedPrompts[i].mesId === incomingMesId) {
+            console.log(`found matching mesID ${i}`);
+            thisPromptSet = i;
+            PromptArrayItemForRawPromptDisplay = i;
+            console.log(`wanting to raw display of ArrayItem: ${PromptArrayItemForRawPromptDisplay} which is mesID ${incomingMesId}`);
+            console.log(itemizedPrompts[thisPromptSet]);
+        }
+    }
+    return thisPromptSet;
+}
+
+async function promptItemize(itemizedPrompts, requestedMesId) {
+    console.log('PROMPT ITEMIZE ENTERED');
+    var incomingMesId = Number(requestedMesId);
+    console.debug(`looking for MesId ${incomingMesId}`);
+    var thisPromptSet = findItemizedPromptSet(itemizedPrompts, incomingMesId);
+
+    if (thisPromptSet === undefined) {
+        console.log(`couldnt find the right mesId. looked for ${incomingMesId}`);
+        console.log(itemizedPrompts);
+        return null;
+    }
+
+    const params = await itemizedParams(itemizedPrompts, thisPromptSet);
 
     if (params.this_main_api == 'openai') {
         const template = await renderTemplateAsync('itemizationChat', params);
@@ -6079,7 +6114,7 @@ async function doOnboarding(avatarId) {
     template.find('input[name="enable_simple_mode"]').on('input', function () {
         simpleUiMode = $(this).is(':checked');
     });
-    var userName = await callPopup(template, 'input', name1);
+    let userName = await callPopup(template, 'input', currentUser?.name || name1);
 
     if (userName) {
         userName = userName.replace('\n', ' ');
@@ -6132,6 +6167,8 @@ async function getSettings() {
             name1 = settings.username;
             $('#your_name').val(name1);
         }
+
+        await setUserControls(data.enable_accounts);
 
         // Allow subscribers to mutate settings
         eventSource.emit(event_types.SETTINGS_LOADED_BEFORE, settings);
@@ -6468,6 +6505,8 @@ async function messageEditDone(div) {
         text = substituteParams(text);
     }
 
+    await eventSource.emit(event_types.MESSAGE_EDITED, this_edit_mes_id);
+    text = chat[this_edit_mes_id]?.mes ?? text;
     mesBlock.find('.mes_text').empty();
     mesBlock.find('.mes_edit_buttons').css('display', 'none');
     mesBlock.find('.mes_buttons').css('display', '');
@@ -6484,7 +6523,6 @@ async function messageEditDone(div) {
     mesBlock.find('.mes_bias').append(messageFormatting(bias, '', false, false, -1));
     appendMediaToMessage(mes, div.closest('.mes'));
     addCopyToCodeBlocks(div.closest('.mes'));
-    await eventSource.emit(event_types.MESSAGE_EDITED, this_edit_mes_id);
 
     this_edit_mes_id = undefined;
     await saveChatConditional();
@@ -6694,7 +6732,7 @@ export async function displayPastChats() {
 
     const debouncedDisplay = debounce((searchQuery) => {
         displayChats(searchQuery);
-    }, 300);
+    });
 
     // Define the search input listener
     $('#select_chat_search').on('input', function () {
@@ -6793,10 +6831,7 @@ function select_rm_info(type, charId, previousCharId = null) {
 
                     const scrollOffset = element.offset().top - element.parent().offset().top;
                     element.parent().scrollTop(scrollOffset);
-                    element.addClass('flash animated');
-                    setTimeout(function () {
-                        element.removeClass('flash animated');
-                    }, 5000);
+                    flashHighlight(element, 5000);
                 });
             } catch (e) {
                 console.error(e);
@@ -6822,10 +6857,7 @@ function select_rm_info(type, charId, previousCharId = null) {
                     const element = $(selector);
                     const scrollOffset = element.offset().top - element.parent().offset().top;
                     element.parent().scrollTop(scrollOffset);
-                    $(element).addClass('flash animated');
-                    setTimeout(function () {
-                        $(element).removeClass('flash animated');
-                    }, 5000);
+                    flashHighlight(element, 5000);
                 });
             } catch (e) {
                 console.error(e);
@@ -7090,67 +7122,59 @@ function onScenarioOverrideRemoveClick() {
  * @param {string} type
  * @param {string} inputValue - Value to set the input to.
  * @param {PopupOptions} options - Options for the popup.
- * @typedef {{okButton?: string, rows?: number, wide?: boolean, large?: boolean, allowHorizontalScrolling?: boolean, allowVerticalScrolling?: boolean }} PopupOptions - Options for the popup.
+ * @typedef {{okButton?: string, rows?: number, wide?: boolean, large?: boolean, allowHorizontalScrolling?: boolean, allowVerticalScrolling?: boolean, cropAspect?: number }} PopupOptions - Options for the popup.
  * @returns
  */
-function callPopup(text, type, inputValue = '', { okButton, rows, wide, large, allowHorizontalScrolling, allowVerticalScrolling } = {}) {
+function callPopup(text, type, inputValue = '', { okButton, rows, wide, large, allowHorizontalScrolling, allowVerticalScrolling, cropAspect } = {}) {
+    function getOkButtonText() {
+        if (['avatarToCrop'].includes(popup_type)) {
+            return okButton ?? 'Accept';
+        } else if (['text', 'alternate_greeting', 'char_not_selected'].includes(popup_type)) {
+            $dialoguePopupCancel.css('display', 'none');
+            return okButton ?? 'Ok';
+        } else if (['delete_extension'].includes(popup_type)) {
+            return okButton ?? 'Ok';
+        } else if (['new_chat', 'confirm'].includes(popup_type)) {
+            return okButton ?? 'Yes';
+        } else if (['input'].includes(popup_type)) {
+            return okButton ?? 'Save';
+        }
+        return okButton ?? 'Delete';
+    }
+
     dialogueCloseStop = true;
     if (type) {
         popup_type = type;
     }
 
-    $('#dialogue_popup').toggleClass('wide_dialogue_popup', !!wide);
-    $('#dialogue_popup').toggleClass('large_dialogue_popup', !!large);
-    $('#dialogue_popup').toggleClass('horizontal_scrolling_dialogue_popup', !!allowHorizontalScrolling);
-    $('#dialogue_popup').toggleClass('vertical_scrolling_dialogue_popup', !!allowVerticalScrolling);
+    const $dialoguePopup = $('#dialogue_popup');
+    const $dialoguePopupCancel = $('#dialogue_popup_cancel');
+    const $dialoguePopupOk = $('#dialogue_popup_ok');
+    const $dialoguePopupInput = $('#dialogue_popup_input');
+    const $dialoguePopupText = $('#dialogue_popup_text');
+    const $shadowPopup = $('#shadow_popup');
 
-    $('#dialogue_popup_cancel').css('display', 'inline-block');
-    switch (popup_type) {
-        case 'avatarToCrop':
-            $('#dialogue_popup_ok').text(okButton ?? 'Accept');
-            break;
-        case 'text':
-        case 'alternate_greeting':
-        case 'char_not_selected':
-            $('#dialogue_popup_ok').text(okButton ?? 'Ok');
-            $('#dialogue_popup_cancel').css('display', 'none');
-            break;
-        case 'delete_extension':
-            $('#dialogue_popup_ok').text(okButton ?? 'Ok');
-            break;
-        case 'new_chat':
-        case 'confirm':
-            $('#dialogue_popup_ok').text(okButton ?? 'Yes');
-            break;
-        case 'del_group':
-        case 'rename_chat':
-        case 'del_chat':
-        default:
-            $('#dialogue_popup_ok').text(okButton ?? 'Delete');
-    }
+    $dialoguePopup.toggleClass('wide_dialogue_popup', !!wide)
+        .toggleClass('large_dialogue_popup', !!large)
+        .toggleClass('horizontal_scrolling_dialogue_popup', !!allowHorizontalScrolling)
+        .toggleClass('vertical_scrolling_dialogue_popup', !!allowVerticalScrolling);
 
-    $('#dialogue_popup_input').val(inputValue);
-    $('#dialogue_popup_input').attr('rows', rows ?? 1);
+    $dialoguePopupCancel.css('display', 'inline-block');
+    $dialoguePopupOk.text(getOkButtonText());
+    $dialoguePopupInput.toggle(popup_type === 'input').val(inputValue).attr('rows', rows ?? 1);
+    $dialoguePopupText.empty().append(text);
+    $shadowPopup.css('display', 'block');
 
     if (popup_type == 'input') {
-        $('#dialogue_popup_input').css('display', 'block');
-        $('#dialogue_popup_ok').text(okButton ?? 'Save');
-    }
-    else {
-        $('#dialogue_popup_input').css('display', 'none');
+        $dialoguePopupInput.trigger('focus');
     }
 
-    $('#dialogue_popup_text').empty().append(text);
-    $('#shadow_popup').css('display', 'block');
-    if (popup_type == 'input') {
-        $('#dialogue_popup_input').focus();
-    }
     if (popup_type == 'avatarToCrop') {
         // unset existing data
         crop_data = undefined;
 
         $('#avatarToCrop').cropper({
-            aspectRatio: 2 / 3,
+            aspectRatio: cropAspect ?? 2 / 3,
             autoCropArea: 1,
             viewMode: 2,
             rotatable: false,
@@ -7160,7 +7184,8 @@ function callPopup(text, type, inputValue = '', { okButton, rows, wide, large, a
             },
         });
     }
-    $('#shadow_popup').transition({
+
+    $shadowPopup.transition({
         opacity: 1,
         duration: animation_duration,
         easing: animation_easing,
@@ -7360,47 +7385,6 @@ export function cancelTtsPlay() {
     if ('speechSynthesis' in window) {
         speechSynthesis.cancel();
     }
-}
-
-async function deleteMessageImage() {
-    const value = await callPopup('<h3>Delete image from message?<br>This action can\'t be undone.</h3>', 'confirm');
-
-    if (!value) {
-        return;
-    }
-
-    const mesBlock = $(this).closest('.mes');
-    const mesId = mesBlock.attr('mesid');
-    const message = chat[mesId];
-    delete message.extra.image;
-    delete message.extra.inline_image;
-    mesBlock.find('.mes_img_container').removeClass('img_extra');
-    mesBlock.find('.mes_img').attr('src', '');
-    await saveChatConditional();
-}
-
-function enlargeMessageImage() {
-    const mesBlock = $(this).closest('.mes');
-    const mesId = mesBlock.attr('mesid');
-    const message = chat[mesId];
-    const imgSrc = message?.extra?.image;
-    const title = message?.extra?.title;
-
-    if (!imgSrc) {
-        return;
-    }
-
-    const img = document.createElement('img');
-    img.classList.add('img_enlarged');
-    img.src = imgSrc;
-    const imgContainer = $('<div><pre><code></code></pre></div>');
-    imgContainer.prepend(img);
-    imgContainer.addClass('img_enlarged_container');
-    imgContainer.find('code').addClass('txt').text(title);
-    const titleEmpty = !title || title.trim().length === 0;
-    imgContainer.find('pre').toggle(!titleEmpty);
-    addCopyToCodeBlocks(imgContainer);
-    callPopup(imgContainer, 'text', '', { wide: true, large: true });
 }
 
 function updateAlternateGreetingsHintVisibility(root) {
@@ -7798,6 +7782,7 @@ window['SillyTavern'].getContext = function () {
          */
         renderExtensionTemplate: renderExtensionTemplate,
         renderExtensionTemplateAsync: renderExtensionTemplateAsync,
+        registerDataBankScraper: ScraperManager.registerDataBankScraper,
         callPopup: callPopup,
         callGenericPopup: callGenericPopup,
         mainApi: main_api,
@@ -8701,14 +8686,20 @@ jQuery(async function () {
 
     $(document).on('click', '.swipe_left', swipe_left);
 
+    const debouncedCharacterSearch = debounce((searchQuery) => {
+        entitiesFilter.setFilterData(FILTER_TYPES.SEARCH, searchQuery);
+    });
     $('#character_search_bar').on('input', function () {
-        const searchValue = String($(this).val()).toLowerCase();
-        entitiesFilter.setFilterData(FILTER_TYPES.SEARCH, searchValue);
+        const searchQuery = String($(this).val()).toLowerCase();
+        debouncedCharacterSearch(searchQuery);
     });
 
+    const debouncedPersonaSearch = debounce((searchQuery) => {
+        personasFilter.setFilterData(FILTER_TYPES.PERSONA_SEARCH, searchQuery);
+    });
     $('#persona_search_bar').on('input', function () {
-        const searchValue = String($(this).val()).toLowerCase();
-        personasFilter.setFilterData(FILTER_TYPES.PERSONA_SEARCH, searchValue);
+        const searchQuery = String($(this).val()).toLowerCase();
+        debouncedPersonaSearch(searchQuery);
     });
 
     $('#mes_continue').on('click', function () {
@@ -10162,6 +10153,7 @@ jQuery(async function () {
             '#character_cross',
             '#avatar-and-name-block',
             '#shadow_popup',
+            '.shadow_popup',
             '#world_popup',
             '.ui-widget',
             '.text_pole',
@@ -10397,9 +10389,6 @@ jQuery(async function () {
         $('#char-management-dropdown').prop('selectedIndex', 0);
     });
 
-    $(document).on('click', '.mes_img_enlarge', enlargeMessageImage);
-    $(document).on('click', '.mes_img_delete', deleteMessageImage);
-
     $(window).on('beforeunload', () => {
         cancelTtsPlay();
         if (streamingProcessor) {
@@ -10552,6 +10541,9 @@ jQuery(async function () {
             <li>Chub Lorebook (Direct Link or ID)<br>Example: <tt>lorebooks/bartleby/example-lorebook</tt></li>
             <li>JanitorAI Character (Direct Link or UUID)<br>Example: <tt>ddd1498a-a370-4136-b138-a8cd9461fdfe_character-aqua-the-useless-goddess</tt></li>
             <li>Pygmalion.chat Character (Direct Link or UUID)<br>Example: <tt>a7ca95a1-0c88-4e23-91b3-149db1e78ab9</tt></li>
+            <li>AICharacterCard.com Character (Direct Link or ID)<br>Example: <tt>AICC/aicharcards/the-game-master</tt></li>
+            <li>Catbox.moe Character image link<br>Example: <tt>https://files.catbox.moe/notarealfile.png</tt></li>
+            <li>Discord Character image link<br>Example: <tt>https://cdn.discordapp.com/attachments/.../alsonotreal.png?...</tt></li>
             <li>More coming soon...</li>
         <ul>`;
         const input = await callPopup(html, 'input', '', { okButton: 'Import', rows: 4 });
